@@ -9,10 +9,12 @@ from sklearn.model_selection import train_test_split
 import json
 import sys
 import traceback
+from typing import Optional
 
-# Thêm vào đầu file train, trước tất cả import
-import sys
-import traceback
+# Thiết lập hiển thị ký tự tiếng Việt trên Windows
+import io
+sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
+sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
 
 def custom_excepthook(exc_type, exc_value, exc_tb):
     with open("error_log.txt", "w", encoding="utf-8") as f:
@@ -22,69 +24,73 @@ def custom_excepthook(exc_type, exc_value, exc_tb):
 sys.excepthook = custom_excepthook
 
 # ==========================================
-# 1. CẤU HÌNH
+# 1. CẤU HÌNH HỆ THỐNG (ĐỌC TRỰC TIẾP FOLDER)
 # ==========================================
-BASE_DIR    = r"C:\Users\MYPC\Downloads\Dataset"
-CSV_PATH    = os.path.join(BASE_DIR, "Labels", "label_gold.csv")
-VIDEOS_DIR  = os.path.join(BASE_DIR, "Videos")
-MODEL_DIR   = os.path.join(BASE_DIR, "Models")
+BASE_DIR      = r"C:\Users\MYPC\Downloads\Dataset"
+VIDEOS_UPDATE = os.path.join(BASE_DIR, "videos_update")
+MODEL_DIR     = os.path.join(BASE_DIR, "Models")
 os.makedirs(MODEL_DIR, exist_ok=True)
 
 N_FRAMES      = 30
 AUGMENT_COUNT = 30
+N_FEATURES    = 345   # Full vector: Pose(99) + LH(63) + RH(63) + Lips(120)
 
-# ── Layout vector keypoints ──────────────────────────────────────────────
-# [  0: 62] Pose      — 33 điểm × 3 = 99   (vai/thân/tay/chân)
-# [ 99:161] Left Hand — 21 điểm × 3 = 63
-# [162:224] Right Hand— 21 điểm × 3 = 63
-# [225:344] Lips      — 40 điểm × 3 = 120
-#                                     ───
-# Tổng đầy đủ (Tay + Thân + Miệng)   = 345
+POSE_SLICE = slice(0,   99)
+LH_SLICE   = slice(99,  162)
+RH_SLICE   = slice(162, 225)
+LIPS_SLICE = slice(225, 345)
 
-N_FEATURES = 345   # full vector — ablation sẽ slice theo index
-
-# Index nhóm
-POSE_SLICE = slice(0,   99)    # thân / pose
-LH_SLICE   = slice(99,  162)   # tay trái
-RH_SLICE   = slice(162, 225)   # tay phải
-LIPS_SLICE = slice(225, 345)   # miệng
-
-# 40 điểm lips (outer + inner) trong face mesh MediaPipe
+# 40 điểm mốc miệng trong Face Mesh
 LIPS_INDICES = [
     61,185,40,39,37,0,267,269,270,409,291,375,
-    321,405,314,17,84,181,91,146,          # outer (20)
+    321,405,314,17,84,181,91,146,
     78,191,80,81,82,13,312,311,310,415,
-    308,324,318,402,317,14,87,178,88,95    # inner (20)
+    308,324,318,402,317,14,87,178,88,95
 ]
 
-print("🚀 PIPELINE HUẤN LUYỆN VSL — SERVER MODE (full quality, 345 features)")
+# Kiểm tra GPU để tối ưu hóa huấn luyện
+gpus = tf.config.list_physical_devices('GPU')
+if gpus:
+    try:
+        for gpu in gpus:
+            tf.config.experimental.set_memory_growth(gpu, True)
+        print(f"[GPU] Tìm thấy GPU: {[g.name for g in gpus]}")
+    except RuntimeError as e:
+        print(f"[GPU] Lỗi cấu hình GPU: {e}")
+else:
+    print("[GPU] Không nhận diện được GPU — sử dụng CPU để huấn luyện")
+
+print(f"[TF] Phiên bản TensorFlow: {tf.__version__}")
+print("🚀 ĐANG KHỞI ĐỘNG PIPELINE HUẤN LUYỆN VSL (ĐỌC FOLDER TRỰC TIẾP)")
 
 # ==========================================
-# 2. LABEL MAP
+# 2. TỰ ĐỘNG QUÉT FOLDER ĐỂ TẠO LABEL MAP
 # ==========================================
-df = pd.read_csv(CSV_PATH)
-df.columns = [c.strip().upper() for c in df.columns]
-unique_labels = sorted(df["LABEL"].unique())
+if not os.path.exists(VIDEOS_UPDATE):
+    print(f"❌ Không tìm thấy thư mục: {VIDEOS_UPDATE}")
+    sys.exit(1)
+
+# Lấy danh sách tên thư mục con làm nhãn
+unique_labels = sorted([
+    d for d in os.listdir(VIDEOS_UPDATE) 
+    if os.path.isdir(os.path.join(VIDEOS_UPDATE, d))
+])
 NUM_CLASSES   = len(unique_labels)
 label_to_id   = {lbl: i for i, lbl in enumerate(unique_labels)}
 id_to_label   = {i: lbl for lbl, i in label_to_id.items()}
 
+# Lưu tệp label_map.json
 with open(os.path.join(MODEL_DIR, "label_map.json"), "w", encoding="utf-8") as f:
     json.dump(id_to_label, f, ensure_ascii=False, indent=2)
 
-print(f"📊 {NUM_CLASSES} nhãn — label_map.json đã lưu")
+print(f"📊 Tìm thấy {NUM_CLASSES} nhãn (thư mục con) — Đã cập nhật label_map.json", flush=True)
 
 # ==========================================
-# 3. TRÍCH XUẤT KEYPOINTS (FULL — 345)
+# 3. TRÍCH XUẤT ĐẶC TRƯNG (POSE + HANDS + LIPS)
 # ==========================================
 mp_holistic = mp.solutions.holistic
 
-def extract_features(video_path: str):
-    """
-    Trả về mảng (T, 345) float32:
-      [:99]   Pose, [99:162] LH, [162:225] RH, [225:345] Lips
-    Không resize, không nén JPEG.
-    """
+def extract_features(video_path: str) -> Optional[np.ndarray]:
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         return None
@@ -127,9 +133,8 @@ def extract_features(video_path: str):
     cap.release()
     return np.array(frames, np.float32) if len(frames) >= 5 else None
 
-
 # ==========================================
-# 4. CHUẨN HÓA VAI + NỘI SUY VỀ N_FRAMES
+# 4. CHUẨN HÓA TỌA ĐỘ VÀ NỘI SUY
 # ==========================================
 def normalize_and_interpolate(seq):
     T = len(seq)
@@ -142,10 +147,9 @@ def normalize_and_interpolate(seq):
                                   fill_value="extrapolate")(x_new)
         seq = out
 
-    # Shoulder normalization — dùng vai trái (11) và phải (12) trong Pose
     normed = np.zeros_like(seq)
     for t, frame in enumerate(seq):
-        kps    = frame.reshape(-1, 3)   # (115, 3)
+        kps    = frame.reshape(-1, 3)
         ls, rs = kps[11], kps[12]
         center = (ls + rs) / 2.0
         scale  = np.linalg.norm(rs - ls)
@@ -155,22 +159,18 @@ def normalize_and_interpolate(seq):
 
     return normed.astype(np.float32)
 
-
 # ==========================================
-# 5. AUGMENTATION
+# 5. AUGMENTATION (TĂNG CƯỜNG DỮ LIỆU)
 # ==========================================
 def augment(seq):
     aug = seq.copy()
 
-    # Nhiễu Gaussian
     if np.random.rand() < 0.6:
         aug += np.random.normal(0, 0.012, aug.shape).astype(np.float32)
 
-    # Scale không gian
     if np.random.rand() < 0.5:
         aug *= np.random.uniform(0.88, 1.12)
 
-    # Time shift ±3 frame
     if np.random.rand() < 0.5:
         shift = np.random.randint(-3, 4)
         if shift > 0:
@@ -178,7 +178,6 @@ def augment(seq):
         elif shift < 0:
             aug = np.pad(aug, ((0, -shift), (0, 0)), mode="edge")[-shift:]
 
-    # Time warp
     if np.random.rand() < 0.4:
         warp  = np.random.uniform(0.85, 1.15)
         T_new = max(5, int(N_FRAMES * warp))
@@ -194,64 +193,85 @@ def augment(seq):
             aug[:, i] = interp1d(x_back, warped[:, i], kind="linear",
                                   fill_value="extrapolate")(x_orig)
 
-    # Mirror tay trái ↔ phải (chỉ mirror phần tay + pose, KHÔNG mirror lips)
     if np.random.rand() < 0.5:
-        # Lấy phần tay + pose (225 feature đầu)
         body = aug[:, :225].reshape(N_FRAMES, 75, 3).copy()
-        body[:, :, 0] *= -1                       # flip trục X
+        body[:, :, 0] *= -1
         lh_tmp = body[:, 33:54].copy()
-        body[:, 33:54] = body[:, 54:75]           # hoán đổi LH ↔ RH
+        body[:, 33:54] = body[:, 54:75]
         body[:, 54:75] = lh_tmp
         aug[:, :225] = body.reshape(N_FRAMES, 225)
-        # Lips: chỉ flip trục X, không hoán đổi
+        
         lips = aug[:, 225:].reshape(N_FRAMES, 40, 3).copy()
         lips[:, :, 0] *= -1
         aug[:, 225:] = lips.reshape(N_FRAMES, 120)
 
     return aug.astype(np.float32)
 
-
 # ==========================================
-# 6. TẠO DATASET
+# 6. QUY TRÌNH NẠP DỮ LIỆU TÍCH HỢP BỘ NHỚ ĐỆM (CACHING)
 # ==========================================
-X_list, Y_list = [], []
-total = len(df)
-print(f"\n🔄 Xử lý {total} video...")
-ok = 0
+CACHE_X_PATH = os.path.join(MODEL_DIR, "X_cached.npy")
+CACHE_Y_PATH = os.path.join(MODEL_DIR, "y_cached.npy")
 
-for idx, row in df.iterrows():
-    vpath    = os.path.join(VIDEOS_DIR, row["VIDEO"])
-    label_id = label_to_id[row["LABEL"]]
+# Kiểm tra sự tồn tại của bộ nhớ đệm trên ổ cứng
+if os.path.exists(CACHE_X_PATH) and os.path.exists(CACHE_Y_PATH):
+    print(f"\n📦 [BỘ NHỚ ĐỆM] Phát hiện dữ liệu tọa độ đã lưu từ trước!")
+    print(f"   Đang nạp nhanh tập dữ liệu từ ổ cứng...", flush=True)
+    X = np.load(CACHE_X_PATH)
+    Y = np.load(CACHE_Y_PATH)
+    print(f"✅ Nạp bộ nhớ đệm thành công — Tập dữ liệu: {X.shape}", flush=True)
+else:
+    # Nếu chưa có bộ nhớ đệm, tiến hành trích xuất MediaPipe từ đầu
+    all_videos = []
+    for label in unique_labels:
+        folder_path = os.path.join(VIDEOS_UPDATE, label)
+        for fname in os.listdir(folder_path):
+            if fname.lower().endswith(".mp4"):
+                all_videos.append((label, os.path.join(folder_path, fname), fname))
 
-    print(f"  [{idx+1}/{total}] {row['VIDEO']} → {row['LABEL']}", end=" ")
+    total = len(all_videos)
+    X_list, Y_list = [], []
+    print(f"\n🔄 Không tìm thấy bộ nhớ đệm. Bắt đầu trích xuất {total} video bằng MediaPipe...", flush=True)
+    ok = 0
 
-    if not os.path.exists(vpath):
-        print("❌ không tìm thấy file"); continue
+    for idx, (label, vpath, fname) in enumerate(all_videos):
+        label_id = label_to_id[label]
+        print(f"  [{idx+1}/{total}] {label}/{fname}", end=" ", flush=True)
 
-    raw = extract_features(vpath)
-    if raw is None:
-        print("❌ video lỗi hoặc quá ngắn"); continue
+        raw = extract_features(vpath)
+        if raw is None:
+            print("❌ (Video lỗi hoặc ngắn)", flush=True); continue
 
-    base = normalize_and_interpolate(raw)
-    X_list.append(base);          Y_list.append(label_id)
-    for _ in range(AUGMENT_COUNT):
-        X_list.append(augment(base)); Y_list.append(label_id)
+        base = normalize_and_interpolate(raw)
+        X_list.append(base)
+        Y_list.append(label_id)
+        
+        for _ in range(AUGMENT_COUNT):
+            X_list.append(augment(base))
+            Y_list.append(label_id)
 
-    ok += 1
-    print(f"✅ ({ok} ok)")
+        ok += 1
+        print("✅ (OK)", flush=True)
 
-X = np.array(X_list, np.float32)
-Y = np.array(Y_list, np.int32)
-print(f"\n✅ {ok}/{total} video — dataset: {X.shape}")
+    X = np.array(X_list, np.float32)
+    Y = np.array(Y_list, np.int32)
+    print(f"\n✅ Hoàn tất xử lý: {ok}/{total} video — Tập dữ liệu: {X.shape}", flush=True)
+    
+    # Tiến hành lưu lại bộ nhớ đệm ra file cứng để tái sử dụng nhanh lần sau
+    print("💾 Đang ghi bộ nhớ đệm ra ổ cứng để bảo toàn dữ liệu...", flush=True)
+    np.save(CACHE_X_PATH, X)
+    np.save(CACHE_Y_PATH, Y)
+    print("✅ Đã lưu bộ nhớ đệm thành công!", flush=True)
 
+# Phân chia dữ liệu train/val
 X_train, X_val, y_train, y_val = train_test_split(
     X, Y, test_size=0.2, random_state=42, stratify=Y
 )
 
 # ==========================================
-# 7. MÔ HÌNH BiLSTM — train trên full 345 features
+# 7. XÂY DỰNG MÔ HÌNH BiLSTM
 # ==========================================
-print("\n🧠 XÂY DỰNG MÔ HÌNH BiLSTM (345 features = Tay + Thân + Miệng)...")
+print("\n🧠 ĐANG KHỞI TẠO CẤU TRÚC MÔ HÌNH BiLSTM (345 ĐẶC TRƯNG)...", flush=True)
 
 inputs = tf.keras.Input(shape=(N_FRAMES, N_FEATURES), name="keypoints")
 x = tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(128, return_sequences=True))(inputs)
@@ -291,7 +311,7 @@ callbacks = [
 # ==========================================
 # 8. HUẤN LUYỆN
 # ==========================================
-print("\n⚡ BẮT ĐẦU HUẤN LUYỆN...")
+print("\n⚡ BẮT ĐẦU QUÁ TRÌNH HUẤN LUYỆN MÔ HÌNH TRÊN GPU...", flush=True)
 model.fit(
     X_train, y_train,
     validation_data=(X_val, y_val),
@@ -300,14 +320,14 @@ model.fit(
 )
 
 # ==========================================
-# 9. ĐÁNH GIÁ & LƯU
+# 9. ĐÁNH GIÁ & XUẤT MÔ HÌNH
 # ==========================================
 best = tf.keras.models.load_model(os.path.join(MODEL_DIR, "best_bilstm.keras"))
 val_loss, val_acc = best.evaluate(X_val, y_val, verbose=0)
-print(f"\n📊 Best model — val_loss: {val_loss:.4f} | val_acc: {val_acc:.4f}")
+print(f"\n📊 Kết quả tốt nhất — val_loss: {val_loss:.4f} | val_acc: {val_acc:.4f}", flush=True)
 
 best.export(os.path.join(MODEL_DIR, "vsl_bilstm_savedmodel"))
-print(f"\n🎉 HOÀN TẤT!")
-print(f"   Model   : {os.path.join(MODEL_DIR, 'best_bilstm.keras')}")
-print(f"   Labels  : {os.path.join(MODEL_DIR, 'label_map.json')}")
-print(f"   Log     : {os.path.join(MODEL_DIR, 'training_log.csv')}")
+print(f"\n🎉 HOÀN TẤT QUÁ TRÌNH HUẤN LUYỆN!", flush=True)
+print(f"   Mô hình lưu tại : {os.path.join(MODEL_DIR, 'best_bilstm.keras')}", flush=True)
+print(f"   Bản đồ nhãn     : {os.path.join(MODEL_DIR, 'label_map.json')}", flush=True)
+print(f"   Nhật ký huấn luyện: {os.path.join(MODEL_DIR, 'training_log.csv')}", flush=True)
