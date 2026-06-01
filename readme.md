@@ -1,28 +1,39 @@
-<<<<<<< HEAD
-# 🤟 Hệ thống Nhận diện Ngôn ngữ Ký hiệu Việt Nam (VSL)
-### End-to-end Pipeline: Thu thập dữ liệu → Huấn luyện → Inference → LLM
+Dưới đây là tệp tin **`README.md`** hoàn chỉnh, chi tiết và có chiều sâu học thuật nhất, tích hợp toàn bộ các thuật toán lai được định lượng hóa chi tiết bằng toán học để bạn sử dụng cho kho lưu trữ mã nguồn của mình:
 
 ---
 
-## Tổng quan kiến trúc
+# 🤟 Hệ thống Nhận diện và Dịch Ngôn ngữ Ký hiệu Việt Nam (VSL) Thời Gian Thực
+### Hệ thống Lai hai giai đoạn (Two-Stage Pipeline): Trích xuất đa phương thức 345 đặc trưng → Huấn luyện BiLSTM → Bộ lọc chuỗi liên tục Hybrid (CVPR 2024 & ESWA 2024) → NLG Translator (vit5 + RAG)
+
+---
+
+## 🌟 1. Tổng quan Kiến trúc Hệ thống
+
+Hệ thống được thiết kế theo mô hình **Hệ thống Lai 2 giai đoạn (Two-Stage Hybrid System)** nhằm giải quyết hai thách thức lớn nhất của bài toán nhận diện ngôn ngữ ký hiệu liên tục (CSLR) là: **Sự thiếu hụt tập dữ liệu câu dài song song** và **Lỗi ranh giới từ do nhiễu chuyển tiếp (co-articulation)** giữa các cử chỉ.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        PIPELINE TỔNG QUÁT                       │
 │                                                                  │
-│  [Camera]                                                 │
+│  [Camera / Stream Video liên tục]                               │
 │       │                                                          │
 │       ▼                                                          │
-│  [MediaPipe Holistic]  ──→  225 keypoints/frame                 │
-│       │                     (33 Pose + 21 LH + 21 RH × 3 trục) │
+│  [MediaPipe Holistic]  ──→  345 keypoints/frame                 │
+│       │                     (33 Pose + 21 LH + 21 RH + 40 Lips) │
 │       ▼                                                          │
 │  [Shoulder Normalization + Interpolation → 30 frames]           │
 │       │                                                          │
 │       ▼                                                          │
-│  [BiLSTM Model]  ──→  Gloss (nhãn ký hiệu đơn lẻ)             │
+│  [BiLSTM Predictor (345)] ──→ Xác suất Softmax của các lớp       │
 │       │                                                          │
 │       ▼                                                          │
-│  [Gloss Sequence Accumulator]                                    │
+│  [Bộ lọc lai Hybrid Post-Processing (CVPR'24 & ESWA'24)]        │
+│       ├── 1. Hàng đợi bỏ phiếu đa số (Voting Bag B=7)            │
+│       ├── 2. Khóa khoảng trống sụt giảm (Gap Suppression)        │
+│       └── 3. Phát hiện đỉnh cực đại (Peak-Valley Detection)      │
+│       │                                                          │
+│       ▼                                                          │
+│  [Chuỗi ký hiệu nén sạch (Gloss Sequence)]                      │
 │       │                                                          │
 │       ▼                                                          │
 │  [LLM (vit5 / GPT-4o)]  ──→  Câu tiếng Việt tự nhiên          │
@@ -32,582 +43,128 @@
 
 ---
 
-## GIAI ĐOẠN 1 — Thu thập & Xây dựng Dataset
+## 🔄 2. Chi tiết các Giai đoạn Xử lý trong Pipeline
 
-### Mô tả
-- Thu thập video ký hiệu từ **3 người thực hiện**
-- **100 từ/ký hiệu** trong ngôn ngữ ký hiệu Việt Nam
-- Mỗi video là 1 lần thực hiện 1 ký hiệu
-- Gán nhãn thủ công qua file `label_gold.csv`
-
-### Cấu trúc dataset
-```
-Dataset/
-├── Videos/          # Video gốc (.mp4)
-│   ├── XIN_CHAO_p1_001.mp4
-│   └── ...
-├── Labels/
-│   └── label_gold.csv   # cột: VIDEO, LABEL
-└── Models/          # Output sau train
-```
-
-### Thông số
-| Thông số | Giá trị |
-|----------|---------|
-| Số nhãn | 100 ký hiệu |
-| Số người quay | 3 |
-| Định dạng | MP4, full quality |
-| Gán nhãn | Thủ công (label_gold.csv) |
+### Giai đoạn 2.1: Quản lý Dữ liệu trực tiếp (Folder-based Dataset)
+Để loại bỏ sự phụ thuộc vào các tệp chỉ mục CSV thủ công dễ sai lệch, hệ thống sử dụng cấu trúc thư mục dữ liệu trực tiếp:
+*   Mỗi thư mục con nằm trong thư mục gốc `videos_update` biểu thị cho chính **Tên của Nhãn (Label)**.
+*   Bên trong thư mục con chứa các video gốc (`W...mp4`) và các video bổ sung góc quay nghiêng trái (`_L`), nghiêng phải (`_R`) của nhiều người ký khác nhau.
+*   Mô hình tự động quét tên thư mục để sinh ra bảng ánh xạ nhãn (`label_map.json`) khi bắt đầu huấn luyện.
 
 ---
 
-## GIAI ĐOẠN 2 — Trích xuất đặc trưng (Feature Extraction)
+### Giai đoạn 2.2: Trích xuất đặc trưng đa phương thức (345 Đặc trưng)
+Để phân biệt các cử chỉ có hướng đi của tay giống nhau nhưng khác biệt ở biểu cảm khuôn mặt hoặc khẩu hình miệng, hệ thống trích xuất **345 tọa độ không gian** bằng bộ công cụ **MediaPipe Holistic (model_complexity=2)**:
+*   **Pose (Thân mình):** 33 điểm mốc $\times$ 3 trục $(x, y, z)$ = **99 đặc trưng** (lấy thông tin khung vai và hướng di chuyển cánh tay).
+*   **Left Hand (Tay trái):** 21 điểm $\times$ 3 trục = **63 đặc trưng**.
+*   **Right Hand (Tay phải):** 21 điểm $\times$ 3 trục = **63 đặc trưng**.
+*   **Lips Mesh (Khẩu hình miệng):** 40 điểm $\times$ 3 trục = **120 đặc trưng** (trích xuất theo chỉ mục vành môi của Face Mesh).
 
-### Công cụ: MediaPipe Holistic
-
-```
-Frame gốc (full resolution, không nén)
-    │
-    ▼
-MediaPipe Holistic (model_complexity=2)
-    ├── Pose landmarks      → 33 điểm × 3 trục = 99 features
-    ├── Left Hand landmarks → 21 điểm × 3 trục = 63 features
-    └── Right Hand landmarks→ 21 điểm × 3 trục = 63 features
-                                                  ──────────
-                                            Tổng: 225 features / frame
-```
-
-> **Lý do bỏ Face Mesh:** Face landmarks (468 điểm) không đóng góp
-> đáng kể cho phân loại VSL nhưng tăng chiều đặc trưng lên ~1600,
-> gây overfitting trên dataset nhỏ.
-
-### Chuẩn hóa Shoulder Normalization
-```python
-center = (vai_trái + vai_phải) / 2
-scale  = ||vai_phải - vai_trái||
-keypoints_norm = (keypoints - center) / scale
-```
-- Loại bỏ ảnh hưởng của khoảng cách người ký đến camera
-- Bất biến với vị trí và tầm vóc người dùng
-
-### Nội suy thời gian
-- Mỗi video có độ dài khác nhau → nội suy tuyến tính về đúng **30 frames**
-- 30 frames ≈ 2 giây @ 15 FPS = đủ bao phủ 1 ký hiệu hoàn chỉnh
+> **Giải pháp tối ưu hóa Face Mesh:** Không lấy toàn bộ 468 điểm mốc trên mặt (gây quá tải tính toán và overfitting), hệ thống chỉ lọc ra đúng **40 điểm mốc môi (Lips Mesh)** dựa theo chỉ mục cố định để bảo toàn thông tin khẩu hình miệng với dung lượng nhẹ nhất.
 
 ---
 
-## GIAI ĐOẠN 3 — Tăng cường dữ liệu (Data Augmentation)
+### Giai đoạn 2.3: Chuẩn hóa khoảng cách vai & Nội suy thời gian
+*   **Shoulder Normalization (Chuẩn hóa vai):** Để mô hình không bị ảnh hưởng bởi việc người dùng đứng xa hay gần camera, tọa độ của tất cả các khớp được dịch chuyển gốc về tâm vai (trung điểm vai trái và vai phải) và chia cho tỷ lệ độ dài xương vai.
+    $$\mathbf{C} = \frac{\mathbf{P}_{left\_shoulder} + \mathbf{P}_{right\_shoulder}}{2}$$
+    $$S = \|\mathbf{P}_{right\_shoulder} - \mathbf{P}_{left\_shoulder}\|_2$$
+    $$\mathbf{P}'_{i} = \frac{\mathbf{P}_{i} - \mathbf{C}}{S}$$
+    *(Trong đó $\mathbf{C}$ là tâm vai, $S$ là tỷ lệ vai, và $\mathbf{P}'_{i}$ là tọa độ khớp sau chuẩn hóa).*
 
-Mỗi video gốc sinh ra **30 bản augment** bằng các phép biến đổi:
-
-| Kỹ thuật | Mô tả | Xác suất |
-|----------|-------|----------|
-| Gaussian Noise | Thêm nhiễu vật lý nhỏ (σ=0.012) | 60% |
-| Scale | Co giãn tay ±12% | 50% |
-| Time Shift | Dịch thời gian ±3 frames | 50% |
-| Time Warp | Co/giãn tốc độ ký hiệu ±15% | 40% |
-| Mirror | Hoán đổi tay trái ↔ phải + flip trục X | 50% |
-
-**Kết quả:** Dataset từ N video gốc → **N × 31 mẫu** sau augmentation
+*   **Linear Interpolation (Nội suy tuyến tính):** Các video có thời lượng khác nhau được nội suy tuyến tính 1 chiều (`scipy.interpolate.interp1d`) đưa về độ dài thống nhất **`N_FRAMES = 30`** (khoảng 1 giây ở tốc độ 30 FPS).
 
 ---
 
-## GIAI ĐOẠN 4 — Huấn luyện mô hình (Training)
-
-### Kiến trúc: Bidirectional LSTM
-
-```
-Input: (30 frames, 225 features)
-    │
-    ▼
-BiLSTM(128)  return_sequences=True   ← nắm bắt ngữ cảnh 2 chiều
-    │
-Dropout(0.3)
-    │
-BiLSTM(64)   return_sequences=False  ← tổng hợp toàn chuỗi
-    │
-Dropout(0.3)
-    │
-Dense(256, relu)
-    │
-Dropout(0.4)
-    │
-Dense(128, relu)
-    │
-Dense(100, softmax)  ← 100 nhãn ký hiệu
-```
-
-### Cấu hình huấn luyện
-| Tham số | Giá trị |
-|---------|---------|
-| Optimizer | Adam (lr=1e-3) |
-| Loss | Sparse Categorical Crossentropy |
-| Batch size | 32 |
-| Epochs tối đa | 150 |
-| Early stopping | patience=20 (monitor val_accuracy) |
-| LR scheduler | ReduceLROnPlateau (factor=0.5, patience=7) |
-| Train/Val split | 80/20, stratified |
-
-### Output
-- `best_bilstm.keras` — model tốt nhất theo val_accuracy
-- `label_map.json` — ánh xạ id → nhãn
-- `training_log.csv` — lịch sử loss/accuracy từng epoch
+### Giai đoạn 2.4: Tăng cường dữ liệu không gian - thời gian (Augmentation)
+Mỗi mẫu dữ liệu gốc được biến đổi ngẫu nhiên thành 30 mẫu khác nhau để chống Overfitting:
+*   *Co giãn tốc độ (Time Warp):* Co giãn thời gian cử chỉ ngẫu nhiên $\pm 15\%$ bằng cách nội suy lại số khung hình.
+*   *Dịch thời gian (Time Shift):* Dịch chuyển thời điểm thực hiện cử chỉ tới/lui $\pm 3$ khung hình và đắp biên (`edge padding`).
+*   *Lật gương bàn tay (Mirror):* Hoán đổi đặc trưng tay trái và tay phải, đồng thời nhân đối xứng trục X của Pose và Lips Mesh (`x = -x`) để mô phỏng cử chỉ bằng tay thuận khác nhau.
 
 ---
 
-## GIAI ĐOẠN 5 — Đánh giá (Evaluation)
+### Giai đoạn 2.5: Huấn luyện BiLSTM & Bộ nhớ đệm (Smart Caching)
+Mô hình chính được xây dựng bằng mạng hồi quy hai chiều Bidirectional LSTM gồm 2 tầng chồng lên nhau:
+*   **BiLSTM tầng 1 (128 units):** Trả về chuỗi đầu ra (`return_sequences=True`) để học ngữ cảnh chuyển động tiến - lùi thời gian sâu của cử chỉ.
+*   **BiLSTM tầng 2 (64 units):** Chỉ trả về vectơ trạng thái cuối cùng (`return_sequences=False`) để tổng hợp toàn bộ chuyển động của chuỗi.
+*   **Mạng nơ-ron Dense kết nối đầy đủ:** Đi qua 2 tầng Dense (256, 128) kích hoạt ReLU kèm tỷ lệ Dropout cao (0.3 - 0.4) chống Overfitting, trước khi đưa ra phân phối xác suất qua tầng Softmax.
 
-### A. Đánh giá model chính
-- Top-1 Accuracy, Top-5 Accuracy
-- Confusion Matrix (toàn bộ 100 lớp)
-- Per-class Precision / Recall / F1
-
-### B. Ablation Study — 5 cấu hình
-
-| Cấu hình | Features | Kiến trúc |
-|----------|----------|-----------|
-| Pose only | 99 | BiLSTM |
-| Hand only | 126 | BiLSTM |
-| Pose+Hand | 225 | GRU (baseline) |
-| Pose+Hand | 225 | Transformer |
-| **Pose+Hand** | **225** | **BiLSTM (đề xuất)** |
-
-> Ablation study chứng minh lý do chọn BiLSTM + Pose+Hand
-> là tốt nhất → điền vào **Table II** bài báo
-
-### C. Test trên người mới (Cross-person)
-- Người thứ 4 chưa xuất hiện trong tập train
-- Đo accuracy cross-person → số liệu generalization
+*   **Cơ chế tự lưu bộ nhớ đệm (Caching):** Quá trình chạy MediaPipe Holistic trên CPU rất tốn thời gian. Hệ thống tích hợp cơ chế tự động ghi nhận dữ liệu đã trích xuất ra các file nhị phân **`X_cached.npy`** và **`y_cached.npy`** trong thư mục `Models/`. Ở các phiên huấn luyện tiếp theo, mô hình sẽ nạp trực tiếp file cache này chỉ mất **1 giây**, loại bỏ hoàn toàn thời gian trích xuất lặp lại.
 
 ---
 
-## GIAI ĐOẠN 6 — Inference Realtime (Server)
+## 🧠 3. Chi tiết thuật toán Bộ lọc hậu xử lý lai (Hybrid Post-Processing Engine)
 
-### Kiến trúc server: FastAPI + WebSocket
-
-```
-Browser (Webcam)
-    │  JPEG frame ~15 FPS qua WebSocket
-    ▼
-FastAPI Server
-    ├── MediaPipe Holistic → 225 keypoints
-    ├── Shoulder normalization
-    ├── Sliding window buffer (30 frames)
-    ├── State machine:
-    │     REST → [energy > threshold] → SIGNING
-    │     SIGNING → [silence ≥ 6 frames] → CONFIRMED → inference
-    │     CONFIRMED → REST
-    ├── BiLSTM.predict() → (nhãn, confidence)
-    └── Broadcast JSON về browser
-```
-
-### State machine detect ký hiệu
-```
-Trạng thái   Điều kiện chuyển
-─────────────────────────────────────────
-REST       → SIGNING    : hand energy > 0.04
-SIGNING    → CONFIRMED  : im lặng ≥ 6 frames
-CONFIRMED  → REST       : sau khi inference xong
-```
-
-### Web Dashboard
-- Live stream có vẽ landmarks
-- State badge (REST / SIGNING / CONFIRMED)
-- Confidence bar + Energy bar
-- Gloss sequence ticker
-- Metrics: FPS, latency, số ký hiệu nhận
+Đây là đóng góp khoa học cốt lõi của hệ thống, giúp chạy nhận diện thời gian thực trên webcam hoặc video chuỗi dài cực kỳ chính xác mà không bị nháy nhãn. Gọi chuỗi xác suất Softmax nhận được từ các cửa sổ trượt liên tiếp là $\mathbf{P} = \{P_1, P_2, \dots, P_T\}$, trong đó tại mỗi thời điểm cửa sổ $t$, mô hình trả về một vectơ xác suất của $C$ lớp từ:
+$$P_t = [p_{t,1}, p_{t,2}, \dots, p_{t,C}] \quad \text{với} \quad \sum_{c=1}^{C} p_{t,c} = 1.0$$
 
 ---
 
-## GIAI ĐOẠN 7 — LLM Sinh câu (NLG)
+### Lớp 1: Bộ lọc ổn định hóa bằng hàng đợi bỏ phiếu đa số (Majority Voting Bag - CVPR 2024)
 
-### Pipeline
+Khi cửa sổ trượt di chuyển với bước nhảy $S = 5$ khung hình, sự chồng lấn thông tin giữa các cửa sổ kề nhau là rất lớn. Tại các vùng chuyển tiếp của tay, mô hình dễ bị phân vân giữa các nhãn tương đồng, dẫn đến hiện tượng nháy nhãn liên tục (flickering).
 
-```
-Gloss sequence: ["XIN", "CHÀO", "TÊN", "TÔI", "LÀ", "NAM"]
-    │
-    ▼
-[Bước 7A] Sinh dataset cặp (gloss → câu) bằng GPT-4o
-    │        100 từ × tổ hợp 2-5 từ → ~500-1000 cặp
-    │
-    ▼
-[Bước 7B] Finetune VietAI/vit5-base trên domain VSL
-    │        So sánh vit5 gốc vs vit5 finetuned → BLEU score
-    │
-    ▼
-[Bước 7C] RAG (Retrieval-Augmented Generation)
-    │        Embed câu tham chiếu bằng PhoBERT + FAISS index
-    │        Retrieve top-3 câu tương tự → đưa vào prompt
-    │
-    ▼
-Output: "Xin chào, tên tôi là Nam."
-```
+1.  **Xác định nhãn thô của cửa sổ ($L_t$):**
+    Tại cửa sổ $t$, nhãn dự đoán thô $L_t$ được xác định dựa trên điểm số tin cậy tối đa:
+    $$L_t = \begin{cases} \text{argmax}_{c} (p_{t,c}) & \text{nếu} \quad \max(P_t) \ge \text{CONF\_THRESHOLD} \quad \text{và} \quad E_t \ge \text{ENERGY\_THRESHOLD} \\ \text{None} (\emptyset) & \text{ngược lại} \end{cases}$$
+    *(Trong đó $E_t$ là năng lượng chuyển động tay của cửa sổ $t$, giúp lọc bỏ vùng tĩnh).*
 
-### Đánh giá LLM
-| Metric | Mô tả |
-|--------|-------|
-| BLEU-1 | Unigram precision |
-| BLEU-2 | Bigram precision |
-| BLEU-4 | Standard MT metric |
-| Latency | ms/câu |
-
-> So sánh 3 hệ thống: Prompt only / Finetuned vit5 / Finetuned + RAG
-> → **Table III** bài báo
+2.  **Cơ chế Bỏ phiếu đa số (Voting):**
+    Hệ thống duy trì một hàng đợi (Queue Bag) chứa kết quả của $B = 7$ cửa sổ gần nhất: $\mathbf{B}_t = [L_{t-B+1}, \dots, L_t]$. Nhãn đồng thuận $V_t$ của cửa sổ $t$ được quyết định bởi số phiếu quá bán:
+    $$V_t = \begin{cases} l^* & \text{nếu} \quad \text{Count}(l^*, \mathbf{B}_t) \ge \text{MIN\_VOTES} \quad \text{với} \quad l^* = \text{argmax}_{l \neq \emptyset} \text{Count}(l, \mathbf{B}_t) \\ \text{None} & \text{ngược lại} \end{cases}$$
+    *(Với cấu hình $B = 7$, `MIN_VOTES` được đặt bằng $4$. Nếu không có nhãn nào đạt tối thiểu 4 phiếu, hệ thống trả về nhãn trống `None`).*
 
 ---
 
-## Tổng hợp số liệu cần cho bài báo
+### Lớp 2: Bộ khóa khoảng trống sụt giảm xác suất (Temporal Gap Suppression - ESWA 2024)
 
-| Bảng | Nội dung | File |
-|------|----------|------|
-| Table I | Thống kê dataset (100 từ, 3 người, N mẫu) | thống kê thủ công |
-| Table II | Ablation study — 5 cấu hình | `ablation_results.csv` |
-| Table III | BLEU score — 3 hệ thống LLM | `bleu_scores.csv` |
-| Table IV | Latency end-to-end (MediaPipe + BiLSTM + LLM) | đo từ dashboard |
-| Figure 1 | Kiến trúc hệ thống tổng quan | vẽ tay hoặc draw.io |
-| Figure 2 | Confusion matrix 100 lớp | `confusion_matrix.png` |
-| Figure 3 | Ablation chart | `ablation_chart.png` |
-| Figure 4 | Training curves (loss/accuracy) | từ `training_log.csv` |
+Người ký không chuyên thường có xu hướng ký ngập ngừng hoặc không đều tay. Điều này khiến đồ thị xác suất của từ đang thực hiện bị sụt giảm tạm thời dưới ngưỡng tin cậy trong vài khung hình (trả về nhãn `None`), trước khi tăng trở lại trên ngưỡng. 
 
----
+Để giải quyết, hệ thống thiết lập một **ngưỡng khóa khoảng tĩnh** `MAX_GAP_WINDOWS = 3` cửa sổ (tương đương khoảng 15 khung hình hay 0.5 giây):
 
-## Checklist trước khi nộp KSE 2025
-
-### Kỹ thuật
-- [ ] Test accuracy trên người thứ 4 (cross-person evaluation)
-- [ ] Ablation study 5 cấu hình chạy xong
-- [ ] Dataset gloss → câu sinh xong (~500 cặp)
-- [ ] Finetune vit5 + đo BLEU
-- [ ] RAG với FAISS tích hợp xong
-- [ ] Latency end-to-end đo thực tế
-
-### Bài viết
-- [ ] Abstract (150-200 từ)
-- [ ] Introduction + Related Work
-- [ ] Methodology (pipeline + kiến trúc)
-- [ ] Experiments & Results (điền số liệu)
-- [ ] Conclusion
-- [ ] Proofread tiếng Anh
+*   **Cơ chế chờ (Pending State):** Khi chuỗi nhãn đang nhận diện từ $A$ đột ngột chuyển sang `None`, hệ thống chưa đóng từ ngay lập tức mà đưa phân đoạn vào trạng thái chờ và bắt đầu đếm số cửa sổ tĩnh: $G_{counter}$.
+*   **Kích hoạt Khóa khoảng trống (Gap Lock):**
+    *   Nếu nhãn $A$ xuất hiện trở lại trước khi $G_{counter} > \text{MAX\_GAP\_WINDOWS}$, hệ thống sẽ **khóa khoảng trống**, coi toàn bộ các cửa sổ tĩnh ở giữa là một phần chuyển động chuyển tiếp trong tiến trình ký từ $A$ và gộp chúng lại vào cùng một phân đoạn.
+    *   Nếu $G_{counter} > \text{MAX\_GAP\_WINDOWS}$, hệ thống xác nhận người ký đã hoàn tất từ và chính thức đóng phân đoạn của từ $A$.
+    *   Nếu một từ mới $B \neq A$ xuất hiện trong thời gian chờ, hệ thống sẽ **lập tức đóng từ $A$** và mở phân đoạn mới cho $B$ để bảo toàn ranh giới cứng giữa hai từ khác nhau.
 
 ---
 
-## Stack công nghệ
+### Lớp 3: Bộ phân tách ranh giới Đỉnh - Thung lũng (Peak-Valley Boundary Segmentation - ESWA 2024)
 
-| Thành phần | Công nghệ |
-|-----------|-----------|
-| Feature extraction | MediaPipe Holistic |
-| Deep learning | TensorFlow / Keras |
-| Model | Bidirectional LSTM |
-| API server | FastAPI + WebSocket |
-| Frontend | HTML / JavaScript |
-| LLM | VietAI/vit5-base (finetune) + GPT-4o |
-| RAG | FAISS + PhoBERT embeddings |
-| Evaluation | scikit-learn, sacrebleu |
-| Language | Python 3.11 |
-=======
-# 🤟 Hệ thống Nhận diện Ngôn ngữ Ký hiệu Việt Nam (VSL)
-### End-to-end Pipeline: Thu thập dữ liệu → Huấn luyện → Inference → LLM
+Lớp lọc thứ ba đảm nhận nhiệm vụ định vị chính xác tâm cử chỉ và giải quyết bài toán: **Làm sao phân biệt giữa một cử chỉ ký rất chậm (độ dài kéo dài) với việc người dùng thực sự muốn ký lặp lại từ đó 2 lần kề nhau?**
 
----
+#### 1. Định vị đỉnh cử chỉ (Peak Detection)
+Đối với một phân đoạn cử chỉ $A$ kéo dài từ cửa sổ thứ $start$ đến cửa sổ thứ $end$, hệ thống dò tìm **Đỉnh cực đại địa phương (Local Maximum)**:
+$$t_{peak} = \text{argmax}_{i \in [start, end]} (p_{i, A})$$
+Thời điểm khung hình tại trung tâm của cửa sổ $t_{peak}$ được đánh mốc là **Tâm cử chỉ (Center of Gesture)** - nơi cử chỉ đạt độ rõ nét và chuẩn xác cao nhất. Giá trị $p_{t_{peak}, A}$ được ghi nhận là độ tin cậy tối đa của phân đoạn.
 
-## Tổng quan kiến trúc
+#### 2. Phân tách thung lũng (Valley Split)
+Nếu người dùng thực hiện lặp lại từ $A$ hai lần liên tiếp (ví dụ ký từ "bạn bạn" để nhấn mạnh), tay của họ sẽ di chuyển về trạng thái trung gian giữa hai lần ký. Lúc này, đường cong xác suất của nhãn $A$ sẽ xuất hiện hai đỉnh (Peak) rõ rệt và bị ngăn cách bởi một điểm sụt giảm sâu ở giữa - gọi là **Thung lũng xác suất (Valley)**.
 
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        PIPELINE TỔNG QUÁT                       │
-│                                                                  │
-│  [Camera]                                                 │
-│       │                                                          │
-│       ▼                                                          │
-│  [MediaPipe Holistic]  ──→  225 keypoints/frame                 │
-│       │                     (33 Pose + 21 LH + 21 RH × 3 trục) │
-│       ▼                                                          │
-│  [Shoulder Normalization + Interpolation → 30 frames]           │
-│       │                                                          │
-│       ▼                                                          │
-│  [BiLSTM Model]  ──→  Gloss (nhãn ký hiệu đơn lẻ)             │
-│       │                                                          │
-│       ▼                                                          │
-│  [Gloss Sequence Accumulator]                                    │
-│       │                                                          │
-│       ▼                                                          │
-│  [LLM (vit5 / GPT-4o)]  ──→  Câu tiếng Việt tự nhiên          │
-│                                                                  │
-└─────────────────────────────────────────────────────────────────┘
-```
+Hệ thống quét chuỗi xác suất của phân đoạn $[p_{start, A}, \dots, p_{end, A}]$ để tìm cửa sổ thung lũng $k$ thỏa mãn điều kiện cực tiểu địa phương:
+$$p_{k, A} < p_{k-1, A} \quad \text{và} \quad p_{k, A} < p_{k+1, A}$$
+
+Tại điểm thung lũng $k$ này, hệ thống tính toán độ sâu sụt giảm xác suất so với đỉnh cực đại:
+$$\Delta = p_{t_{peak}, A} - p_{k, A}$$
+
+*   Nếu $\Delta > \text{VALLEY\_THRESHOLD}$ (mặc định đặt là `0.30` theo thực nghiệm của bài báo ESWA), hệ thống xác nhận có hành vi lặp cử chỉ chủ ý và **tiến hành cắt đôi phân đoạn** tại vị trí $k$ thành hai phân đoạn từ $A$ độc lập.
+*   Nếu $\Delta \le \text{VALLEY\_THRESHOLD}$, hệ thống coi đây chỉ là sự dao động xác suất nhỏ khi ký chậm và giữ nguyên làm một phân đoạn duy nhất.
 
 ---
 
-## GIAI ĐOẠN 1 — Thu thập & Xây dựng Dataset
+## 📝 5. Giải thuật chuyển ngữ nâng cao (LLM & RAG Translation)
 
-### Mô tả
-- Thu thập video ký hiệu từ **3 người thực hiện**
-- **100 từ/ký hiệu** trong ngôn ngữ ký hiệu Việt Nam
-- Mỗi video là 1 lần thực hiện 1 ký hiệu
-- Gán nhãn thủ công qua file `label_gold.csv`
+Pha sinh câu tự nhiên (NLG) chuyển dịch chuỗi nhãn viết hoa (Gloss) thành câu tiếng Việt hoàn chỉnh thông qua giải thuật:
 
-### Cấu trúc dataset
 ```
-Dataset/
-├── Videos/          # Video gốc (.mp4)
-│   ├── XIN_CHAO_p1_001.mp4
-│   └── ...
-├── Labels/
-│   └── label_gold.csv   # cột: VIDEO, LABEL
-└── Models/          # Output sau train
+[Chuỗi Gloss sạch] ──► [FAISS Index] ──► [Truy vấn top-3 câu tương tự] ──► [ vit5-base Finetuned + RAG ] ──► [Câu dịch]
 ```
 
-### Thông số
-| Thông số | Giá trị |
-|----------|---------|
-| Số nhãn | 100 ký hiệu |
-| Số người quay | 3 |
-| Định dạng | MP4, full quality |
-| Gán nhãn | Thủ công (label_gold.csv) |
+*   **Finetuned VietAI/vit5-base:** Mô hình học máy dịch thuật dạng Sequence-to-Sequence được tinh chỉnh trực tiếp trên tập dữ liệu câu ghép VSL để tối ưu hóa khả năng sắp xếp lại trật tự từ (đặc thù ngữ pháp ngôn ngữ ký hiệu thường bị đảo ngược so với văn bản nói).
+*   **Hạ tầng RAG (Retrieval-Augmented Generation):**
+    *   Sử dụng PhoBERT để nhúng toàn bộ câu tiếng Việt chuẩn trong cơ sở dữ liệu thành các vectơ đặc trưng và lưu trữ vào chỉ mục của thư viện **FAISS** (Facebook AI Similarity Search).
+    *   Khi có chuỗi Gloss đầu ra, FAISS sẽ truy vấn không gian vector để lấy ra 3 cặp câu tương đồng nhất đưa vào Prompt làm ngữ cảnh mồi (In-context learning), ép mô hình vit5 dịch chuẩn xác ngữ pháp Tiếng Việt và ngăn ngừa lỗi dịch sai nghĩa.
 
 ---
 
-## GIAI ĐOẠN 2 — Trích xuất đặc trưng (Feature Extraction)
-
-### Công cụ: MediaPipe Holistic
-
-```
-Frame gốc (full resolution, không nén)
-    │
-    ▼
-MediaPipe Holistic (model_complexity=2)
-    ├── Pose landmarks      → 33 điểm × 3 trục = 99 features
-    ├── Left Hand landmarks → 21 điểm × 3 trục = 63 features
-    └── Right Hand landmarks→ 21 điểm × 3 trục = 63 features
-                                                  ──────────
-                                            Tổng: 225 features / frame
-```
-
-> **Lý do bỏ Face Mesh:** Face landmarks (468 điểm) không đóng góp
-> đáng kể cho phân loại VSL nhưng tăng chiều đặc trưng lên ~1600,
-> gây overfitting trên dataset nhỏ.
-
-### Chuẩn hóa Shoulder Normalization
-```python
-center = (vai_trái + vai_phải) / 2
-scale  = ||vai_phải - vai_trái||
-keypoints_norm = (keypoints - center) / scale
-```
-- Loại bỏ ảnh hưởng của khoảng cách người ký đến camera
-- Bất biến với vị trí và tầm vóc người dùng
-
-### Nội suy thời gian
-- Mỗi video có độ dài khác nhau → nội suy tuyến tính về đúng **30 frames**
-- 30 frames ≈ 2 giây @ 15 FPS = đủ bao phủ 1 ký hiệu hoàn chỉnh
-
----
-
-## GIAI ĐOẠN 3 — Tăng cường dữ liệu (Data Augmentation)
-
-Mỗi video gốc sinh ra **30 bản augment** bằng các phép biến đổi:
-
-| Kỹ thuật | Mô tả | Xác suất |
-|----------|-------|----------|
-| Gaussian Noise | Thêm nhiễu vật lý nhỏ (σ=0.012) | 60% |
-| Scale | Co giãn tay ±12% | 50% |
-| Time Shift | Dịch thời gian ±3 frames | 50% |
-| Time Warp | Co/giãn tốc độ ký hiệu ±15% | 40% |
-| Mirror | Hoán đổi tay trái ↔ phải + flip trục X | 50% |
-
-**Kết quả:** Dataset từ N video gốc → **N × 31 mẫu** sau augmentation
-
----
-
-## GIAI ĐOẠN 4 — Huấn luyện mô hình (Training)
-
-### Kiến trúc: Bidirectional LSTM
-
-```
-Input: (30 frames, 225 features)
-    │
-    ▼
-BiLSTM(128)  return_sequences=True   ← nắm bắt ngữ cảnh 2 chiều
-    │
-Dropout(0.3)
-    │
-BiLSTM(64)   return_sequences=False  ← tổng hợp toàn chuỗi
-    │
-Dropout(0.3)
-    │
-Dense(256, relu)
-    │
-Dropout(0.4)
-    │
-Dense(128, relu)
-    │
-Dense(100, softmax)  ← 100 nhãn ký hiệu
-```
-
-### Cấu hình huấn luyện
-| Tham số | Giá trị |
-|---------|---------|
-| Optimizer | Adam (lr=1e-3) |
-| Loss | Sparse Categorical Crossentropy |
-| Batch size | 32 |
-| Epochs tối đa | 150 |
-| Early stopping | patience=20 (monitor val_accuracy) |
-| LR scheduler | ReduceLROnPlateau (factor=0.5, patience=7) |
-| Train/Val split | 80/20, stratified |
-
-### Output
-- `best_bilstm.keras` — model tốt nhất theo val_accuracy
-- `label_map.json` — ánh xạ id → nhãn
-- `training_log.csv` — lịch sử loss/accuracy từng epoch
-
----
-
-## GIAI ĐOẠN 5 — Đánh giá (Evaluation)
-
-### A. Đánh giá model chính
-- Top-1 Accuracy, Top-5 Accuracy
-- Confusion Matrix (toàn bộ 100 lớp)
-- Per-class Precision / Recall / F1
-
-### B. Ablation Study — 5 cấu hình
-
-| Cấu hình | Features | Kiến trúc |
-|----------|----------|-----------|
-| Pose only | 99 | BiLSTM |
-| Hand only | 126 | BiLSTM |
-| Pose+Hand | 225 | GRU (baseline) |
-| Pose+Hand | 225 | Transformer |
-| **Pose+Hand** | **225** | **BiLSTM (đề xuất)** |
-
-> Ablation study chứng minh lý do chọn BiLSTM + Pose+Hand
-> là tốt nhất → điền vào **Table II** bài báo
-
-### C. Test trên người mới (Cross-person)
-- Người thứ 4 chưa xuất hiện trong tập train
-- Đo accuracy cross-person → số liệu generalization
-
----
-
-## GIAI ĐOẠN 6 — Inference Realtime (Server)
-
-### Kiến trúc server: FastAPI + WebSocket
-
-```
-Browser (Webcam)
-    │  JPEG frame ~15 FPS qua WebSocket
-    ▼
-FastAPI Server
-    ├── MediaPipe Holistic → 225 keypoints
-    ├── Shoulder normalization
-    ├── Sliding window buffer (30 frames)
-    ├── State machine:
-    │     REST → [energy > threshold] → SIGNING
-    │     SIGNING → [silence ≥ 6 frames] → CONFIRMED → inference
-    │     CONFIRMED → REST
-    ├── BiLSTM.predict() → (nhãn, confidence)
-    └── Broadcast JSON về browser
-```
-
-### State machine detect ký hiệu
-```
-Trạng thái   Điều kiện chuyển
-─────────────────────────────────────────
-REST       → SIGNING    : hand energy > 0.04
-SIGNING    → CONFIRMED  : im lặng ≥ 6 frames
-CONFIRMED  → REST       : sau khi inference xong
-```
-
-### Web Dashboard
-- Live stream có vẽ landmarks
-- State badge (REST / SIGNING / CONFIRMED)
-- Confidence bar + Energy bar
-- Gloss sequence ticker
-- Metrics: FPS, latency, số ký hiệu nhận
-
----
-
-## GIAI ĐOẠN 7 — LLM Sinh câu (NLG)
-
-### Pipeline
-
-```
-Gloss sequence: ["XIN", "CHÀO", "TÊN", "TÔI", "LÀ", "NAM"]
-    │
-    ▼
-[Bước 7A] Sinh dataset cặp (gloss → câu) bằng GPT-4o
-    │        100 từ × tổ hợp 2-5 từ → ~500-1000 cặp
-    │
-    ▼
-[Bước 7B] Finetune VietAI/vit5-base trên domain VSL
-    │        So sánh vit5 gốc vs vit5 finetuned → BLEU score
-    │
-    ▼
-[Bước 7C] RAG (Retrieval-Augmented Generation)
-    │        Embed câu tham chiếu bằng PhoBERT + FAISS index
-    │        Retrieve top-3 câu tương tự → đưa vào prompt
-    │
-    ▼
-Output: "Xin chào, tên tôi là Nam."
-```
-
-### Đánh giá LLM
-| Metric | Mô tả |
-|--------|-------|
-| BLEU-1 | Unigram precision |
-| BLEU-2 | Bigram precision |
-| BLEU-4 | Standard MT metric |
-| Latency | ms/câu |
-
-> So sánh 3 hệ thống: Prompt only / Finetuned vit5 / Finetuned + RAG
-> → **Table III** bài báo
-
----
-
-## Tổng hợp số liệu cần cho bài báo
-
-| Bảng | Nội dung | File |
-|------|----------|------|
-| Table I | Thống kê dataset (100 từ, 3 người, N mẫu) | thống kê thủ công |
-| Table II | Ablation study — 5 cấu hình | `ablation_results.csv` |
-| Table III | BLEU score — 3 hệ thống LLM | `bleu_scores.csv` |
-| Table IV | Latency end-to-end (MediaPipe + BiLSTM + LLM) | đo từ dashboard |
-| Figure 1 | Kiến trúc hệ thống tổng quan | vẽ tay hoặc draw.io |
-| Figure 2 | Confusion matrix 100 lớp | `confusion_matrix.png` |
-| Figure 3 | Ablation chart | `ablation_chart.png` |
-| Figure 4 | Training curves (loss/accuracy) | từ `training_log.csv` |
-
----
-
-## Checklist trước khi nộp KSE 2025
-
-### Kỹ thuật
-- [ ] Test accuracy trên người thứ 4 (cross-person evaluation)
-- [ ] Ablation study 5 cấu hình chạy xong
-- [ ] Dataset gloss → câu sinh xong (~500 cặp)
-- [ ] Finetune vit5 + đo BLEU
-- [ ] RAG với FAISS tích hợp xong
-- [ ] Latency end-to-end đo thực tế
-
-### Bài viết
-- [ ] Abstract (150-200 từ)
-- [ ] Introduction + Related Work
-- [ ] Methodology (pipeline + kiến trúc)
-- [ ] Experiments & Results (điền số liệu)
-- [ ] Conclusion
-- [ ] Proofread tiếng Anh
-
----
-
-## Stack công nghệ
-
-| Thành phần | Công nghệ |
-|-----------|-----------|
-| Feature extraction | MediaPipe Holistic |
-| Deep learning | TensorFlow / Keras |
-| Model | Bidirectional LSTM |
-| API server | FastAPI + WebSocket |
-| Frontend | HTML / JavaScript |
-| LLM | VietAI/vit5-base (finetune) + GPT-4o |
-| RAG | FAISS + PhoBERT embeddings |
-| Evaluation | scikit-learn, sacrebleu |
-| Language | Python 3.11 |
->>>>>>> 902a929ca3ba34f328fc9104e9f0767a133bc190
