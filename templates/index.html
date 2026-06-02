@@ -1,0 +1,259 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<title>VSL Realtime Demo</title>
+<style>
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:#0f1117;color:#e2e8f0;font-family:'Segoe UI',sans-serif;
+       display:flex;flex-direction:column;align-items:center;min-height:100vh}
+  header{width:100%;background:#1a1d2e;padding:14px 24px;
+         display:flex;align-items:center;gap:12px;border-bottom:1px solid #2d3250}
+  header h1{font-size:1.2rem;font-weight:700;letter-spacing:.5px}
+  .badge{font-size:.7rem;background:#4c9be8;padding:3px 10px;
+         border-radius:99px;font-weight:600}
+  .badge-green{background:#276749}
+  .main{display:flex;gap:20px;padding:20px;width:100%;max-width:1280px;flex-wrap:wrap}
+
+  /* Video Panel */
+  .video-panel{position:relative;flex:1 1 640px}
+  #canvas{width:100%;border-radius:12px;background:#000;display:block;box-shadow: 0 4px 6px rgba(0,0,0,0.3);}
+  .overlay-badges{position:absolute;top:10px;left:10px;display:flex;gap:8px}
+  .state-badge{padding:4px 12px;border-radius:99px;font-size:.75rem;font-weight:700; transition: background 0.3s;}
+  .state-REST     {background:#2d3250;color:#a0aec0}
+  .state-SIGNING  {background:#276749;color:#9ae6b4}
+  .state-CONFIRMED{background:#1a365d;color:#90cdf4}
+  .fps-badge{position:absolute;top:10px;right:10px;background:rgba(0,0,0,.6);
+             padding:3px 8px;border-radius:6px;font-size:.75rem}
+  .lips-badge{position:absolute;bottom:10px;left:10px;background:rgba(0,0,0,.6);
+              padding:3px 8px;border-radius:6px;font-size:.72rem;color:#fbd38d}
+
+  /* Side Panel */
+  .side{flex:0 0 340px;display:flex;flex-direction:column;gap:14px}
+  .card{background:#1a1d2e;border-radius:12px;padding:16px;border:1px solid #2d3250;box-shadow: 0 4px 6px rgba(0,0,0,0.1);}
+  .card h3{font-size:.72rem;text-transform:uppercase;letter-spacing:1px;
+           color:#718096;margin-bottom:10px; display:flex; justify-content:space-between}
+
+  /* Prediction */
+  #pred-label{font-size:2.2rem;font-weight:800;color:#90cdf4;letter-spacing:1px;
+              min-height:3rem;transition:all .2s; line-height:1.2}
+  #pred-conf{font-size:.85rem;color:#a0aec0;margin-top:4px}
+  .conf-bar{height:6px;background:#2d3250;border-radius:99px;margin-top:8px; overflow:hidden}
+  #conf-fill{height:100%;background:#4c9be8;border-radius:99px;transition:width .3s;width:0%}
+
+  /* Energy Bars */
+  .energy-row{display:flex;gap:8px;align-items:center;margin-top:8px}
+  .energy-label{font-size:.7rem;color:#718096;min-width:40px; font-weight:bold}
+  .energy-track{flex:1;height:8px;background:#2d3250;border-radius:99px; overflow:hidden}
+  .energy-fill-hand{height:100%;background:#68d391;border-radius:99px;transition:width .1s;width:0%}
+  .energy-fill-lips{height:100%;background:#fbd38d;border-radius:99px;transition:width .1s;width:0%}
+
+  /* Gloss Sequence */
+  #gloss-box{display:flex;flex-wrap:wrap;gap:6px;min-height:40px; align-content: flex-start;}
+  .gloss-chip{background:#2d3250;border-radius:6px;padding:5px 12px;font-size:.85rem;font-weight:600; border:1px solid #4a5568}
+  .gloss-chip.new{background:#2c5282;color:#bee3f8; border-color:#4c9be8; animation: pop 0.3s ease-out}
+
+  /* Sentence Translation */
+  #sentence-box{font-size:1.1rem;line-height:1.5;color:#e2e8f0;min-height:3rem; padding:10px; background:#0f1117; border-radius:8px; border:1px dashed #2d3250}
+  .translating-text{color:#f6ad55; font-size: 0.85rem; font-style: italic; animation: pulse 1s infinite}
+
+  @keyframes pop { 0% {transform: scale(0.8); opacity: 0} 100% {transform: scale(1); opacity: 1} }
+  @keyframes pulse { 0% {opacity: 0.5} 50% {opacity: 1} 100% {opacity: 0.5} }
+
+  /* Buttons */
+  .btn{width:100%;padding:10px;border:none;border-radius:8px;
+       font-size:.9rem;font-weight:600;cursor:pointer;transition:opacity .2s}
+  .btn:hover{opacity:.85}
+  .btn-start{background:#276749;color:#fff}
+  .btn-stop {background:#742a2a;color:#fff}
+  .btn-clear{background:#2d3250;color:#a0aec0}
+
+  /* Metrics */
+  .metrics{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+  .metric{background:#0f1117;border-radius:8px;padding:10px;text-align:center}
+  .metric .val{font-size:1.2rem;font-weight:700;color:#90cdf4}
+  .metric .lbl{font-size:.68rem;color:#718096;margin-top:2px}
+</style>
+</head>
+<body>
+<header>
+  <span>🤟</span>
+  <h1>VSL Realtime Recognition & Translation</h1>
+  <span class="badge">BiLSTM + Vit5 RAG</span>
+  <span class="badge badge-green">Pose + Hand + Lips</span>
+</header>
+
+<div class="main">
+  <!-- Video -->
+  <div class="video-panel">
+    <canvas id="canvas" width="640" height="480"></canvas>
+    <div class="overlay-badges">
+      <span id="state-badge" class="state-badge state-REST">REST</span>
+    </div>
+    <span class="fps-badge" id="fps-display">0 FPS</span>
+    <span class="lips-badge" id="lips-status">👄 Lips: —</span>
+  </div>
+
+  <!-- Side -->
+  <div class="side">
+    <!-- Prediction -->
+    <div class="card">
+      <h3>Nhận diện hiện tại</h3>
+      <div id="pred-label">—</div>
+      <div id="pred-conf">Độ tin cậy: —</div>
+      <div class="conf-bar"><div id="conf-fill"></div></div>
+    </div>
+
+    <!-- Energy -->
+    <div class="card">
+      <h3>Năng lượng chuyển động</h3>
+      <div class="energy-row">
+        <span class="energy-label">🖐 Tay</span>
+        <div class="energy-track"><div class="energy-fill-hand" id="energy-hand"></div></div>
+      </div>
+      <div class="energy-row">
+        <span class="energy-label">👄 Miệng</span>
+        <div class="energy-track"><div class="energy-fill-lips" id="energy-lips"></div></div>
+      </div>
+    </div>
+
+    <!-- Gloss -->
+    <div class="card">
+      <h3>Chuỗi ký hiệu (Gloss)</h3>
+      <div id="gloss-box"><span style="color:#4a5568;font-size:.8rem">Chưa có...</span></div>
+    </div>
+
+    <!-- Sentence -->
+    <div class="card">
+      <h3>Dịch Tiếng Việt (LLM)</h3>
+      <div id="sentence-box" style="color:#4a5568">Đang chờ ký hiệu...</div>
+    </div>
+
+    <!-- Controls -->
+    <div class="card">
+      <h3>Điều khiển</h3>
+      <div style="display:flex;flex-direction:column;gap:8px">
+        <button class="btn btn-start" id="btn-start" onclick="startCam()">▶ Bắt đầu Camera</button>
+        <button class="btn btn-stop"  id="btn-stop"  onclick="stopCam()" disabled>■ Dừng Camera</button>
+        <button class="btn btn-clear" onclick="clearGloss()">✕ Xoá chuỗi & Làm mới</button>
+      </div>
+    </div>
+
+    <!-- Metrics -->
+    <div class="card">
+      <h3>Thống kê Server</h3>
+      <div class="metrics">
+        <div class="metric"><div class="val" id="m-latency">—</div><div class="lbl">Trễ (ms)</div></div>
+        <div class="metric"><div class="val" id="m-total">0</div><div class="lbl">Từ đã nhận</div></div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+let ws, stream, animId;
+let totalSigns=0;
+const canvas=document.getElementById('canvas');
+const ctx=canvas.getContext('2d');
+let video;
+
+async function startCam(){
+  stream=await navigator.mediaDevices.getUserMedia({video:{width:640,height:480}});
+  video=document.createElement('video');
+  video.srcObject=stream; video.play();
+  document.getElementById('btn-start').disabled=true;
+  document.getElementById('btn-stop').disabled=false;
+  
+  ws=new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType='arraybuffer';
+  ws.onmessage=handleMsg;
+  ws.onopen=()=>loop();
+}
+
+function stopCam(){
+  cancelAnimationFrame(animId);
+  if(stream) stream.getTracks().forEach(t=>t.stop());
+  if(ws) ws.close();
+  document.getElementById('btn-start').disabled=false;
+  document.getElementById('btn-stop').disabled=true;
+}
+
+function clearGloss(){
+  document.getElementById('gloss-box').innerHTML='<span style="color:#4a5568;font-size:.8rem">Chưa có...</span>';
+  document.getElementById('sentence-box').innerHTML='Đang chờ ký hiệu...';
+  if(ws&&ws.readyState===1) ws.send(JSON.stringify({action:'clear_gloss'}));
+}
+
+let lastFrameTime=0;
+function loop(){
+  animId=requestAnimationFrame(loop);
+  const now=performance.now();
+  if(now-lastFrameTime<66) return; // Giới hạn ~15 FPS gửi lên server để không làm nghẽn mạng
+  lastFrameTime=now;
+  if(!video||video.readyState<2) return;
+  
+  ctx.drawImage(video,0,0,640,480);
+  canvas.toBlob(blob=>{
+    if(ws&&ws.readyState===1) blob.arrayBuffer().then(buf=>ws.send(buf));
+  },'image/jpeg',0.7);
+}
+
+function handleMsg(evt){
+  const d=JSON.parse(evt.data);
+
+  // Cập nhật khung hình đã vẽ Landmarks
+  if(d.frame){
+    const img=new Image();
+    img.onload=()=>ctx.drawImage(img,0,0,640,480);
+    img.src='data:image/jpeg;base64,'+d.frame;
+  }
+
+  // Trạng thái nhận diện
+  const badge=document.getElementById('state-badge');
+  badge.textContent=d.state||'REST';
+  badge.className='state-badge state-'+(d.state||'REST');
+  if(d.fps) document.getElementById('fps-display').textContent=d.fps.toFixed(1)+' FPS';
+
+  // Năng lượng chuyển động
+  if(d.energy_hand!==undefined){
+    document.getElementById('energy-hand').style.width=Math.min(d.energy_hand*200,100)+'%';
+  }
+  if(d.energy_lips!==undefined){
+    document.getElementById('energy-lips').style.width=Math.min(d.energy_lips*500,100)+'%';
+    document.getElementById('lips-status').textContent='👄 Lips: '+(d.lips_detected?'✅':'—');
+  }
+
+  // Kết quả nhãn
+  if(d.label){
+    document.getElementById('pred-label').textContent=d.label;
+    document.getElementById('pred-conf').textContent='Độ tin cậy: '+(d.conf*100).toFixed(1)+'%';
+    document.getElementById('conf-fill').style.width=(d.conf*100)+'%';
+    document.getElementById('m-latency').textContent=d.latency_ms||'—';
+    if(d.is_new){
+      totalSigns++;
+      document.getElementById('m-total').textContent=totalSigns;
+    }
+  }
+
+  // Chuỗi Gloss
+  if(d.gloss_seq && d.gloss_seq.length>0){
+    document.getElementById('gloss-box').innerHTML=
+      d.gloss_seq.map((g,i)=>
+        `<span class="gloss-chip${i===d.gloss_seq.length-1?' new':''}">${g}</span>`
+      ).join('');
+  } else if (d.gloss_seq && d.gloss_seq.length === 0) {
+    document.getElementById('gloss-box').innerHTML='<span style="color:#4a5568;font-size:.8rem">Chưa có...</span>';
+  }
+
+  // Cập nhật câu dịch LLM
+  const sentenceBox = document.getElementById('sentence-box');
+  if (d.is_translating) {
+    sentenceBox.innerHTML = '<span class="translating-text">✨ AI đang dịch nghĩa...</span>';
+  } else if (d.sentence) {
+    sentenceBox.innerHTML = d.sentence;
+    sentenceBox.style.color = '#e2e8f0';
+  }
+}
+</script>
+</body>
+</html>
