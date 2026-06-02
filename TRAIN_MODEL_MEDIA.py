@@ -1,20 +1,30 @@
 import os
 import cv2
+import random
 import numpy as np
 import pandas as pd
 import mediapipe as mp
 import tensorflow as tf
 from scipy.interpolate import interp1d
 from sklearn.model_selection import train_test_split
+from sklearn.utils.class_weight import compute_class_weight
+from tqdm import tqdm
 import json
 import sys
 import traceback
 from typing import Optional
 
-# Thiết lập hiển thị ký tự tiếng Việt trên Windows
+# ==========================================
+# 0. ENCODING & SEED
+# ==========================================
 import io
 sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace')
 sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace')
+
+SEED = 42
+random.seed(SEED)
+np.random.seed(SEED)
+tf.random.set_seed(SEED)
 
 def custom_excepthook(exc_type, exc_value, exc_tb):
     with open("error_log.txt", "w", encoding="utf-8") as f:
@@ -24,7 +34,7 @@ def custom_excepthook(exc_type, exc_value, exc_tb):
 sys.excepthook = custom_excepthook
 
 # ==========================================
-# 1. CẤU HÌNH HỆ THỐNG (ĐỌC TRỰC TIẾP FOLDER)
+# 1. CẤU HÌNH HỆ THỐNG
 # ==========================================
 BASE_DIR      = r"C:\Users\MYPC\Downloads\Dataset"
 VIDEOS_UPDATE = os.path.join(BASE_DIR, "videos_update")
@@ -33,7 +43,7 @@ os.makedirs(MODEL_DIR, exist_ok=True)
 
 N_FRAMES      = 30
 AUGMENT_COUNT = 30
-N_FEATURES    = 345   # Full vector: Pose(99) + LH(63) + RH(63) + Lips(120)
+N_FEATURES    = 345   # Pose(99) + LH(63) + RH(63) + Lips(120)
 
 POSE_SLICE = slice(0,   99)
 LH_SLICE   = slice(99,  162)
@@ -48,7 +58,7 @@ LIPS_INDICES = [
     308,324,318,402,317,14,87,178,88,95
 ]
 
-# Kiểm tra GPU để tối ưu hóa huấn luyện
+# Cấu hình GPU
 gpus = tf.config.list_physical_devices('GPU')
 if gpus:
     try:
@@ -61,29 +71,28 @@ else:
     print("[GPU] Không nhận diện được GPU — sử dụng CPU để huấn luyện")
 
 print(f"[TF] Phiên bản TensorFlow: {tf.__version__}")
-print("🚀 ĐANG KHỞI ĐỘNG PIPELINE HUẤN LUYỆN VSL (ĐỌC FOLDER TRỰC TIẾP)")
+print("🚀 ĐANG KHỞI ĐỘNG PIPELINE HUẤN LUYỆN VSL")
 
 # ==========================================
-# 2. TỰ ĐỘNG QUÉT FOLDER ĐỂ TẠO LABEL MAP
+# 2. QUÉT FOLDER & TẠO LABEL MAP
 # ==========================================
 if not os.path.exists(VIDEOS_UPDATE):
     print(f"❌ Không tìm thấy thư mục: {VIDEOS_UPDATE}")
     sys.exit(1)
 
-# Lấy danh sách tên thư mục con làm nhãn
 unique_labels = sorted([
-    d for d in os.listdir(VIDEOS_UPDATE) 
+    d for d in os.listdir(VIDEOS_UPDATE)
     if os.path.isdir(os.path.join(VIDEOS_UPDATE, d))
 ])
-NUM_CLASSES   = len(unique_labels)
-label_to_id   = {lbl: i for i, lbl in enumerate(unique_labels)}
-id_to_label   = {i: lbl for lbl, i in label_to_id.items()}
+NUM_CLASSES = len(unique_labels)
+label_to_id = {lbl: i for i, lbl in enumerate(unique_labels)}
+id_to_label = {i: lbl for lbl, i in label_to_id.items()}
 
-# Lưu tệp label_map.json
-with open(os.path.join(MODEL_DIR, "label_map.json"), "w", encoding="utf-8") as f:
+label_map_path = os.path.join(MODEL_DIR, "label_map.json")
+with open(label_map_path, "w", encoding="utf-8") as f:
     json.dump(id_to_label, f, ensure_ascii=False, indent=2)
 
-print(f"📊 Tìm thấy {NUM_CLASSES} nhãn (thư mục con) — Đã cập nhật label_map.json", flush=True)
+print(f"📊 Tìm thấy {NUM_CLASSES} nhãn — Đã cập nhật label_map.json", flush=True)
 
 # ==========================================
 # 3. TRÍCH XUẤT ĐẶC TRƯNG (POSE + HANDS + LIPS)
@@ -136,7 +145,7 @@ def extract_features(video_path: str) -> Optional[np.ndarray]:
 # ==========================================
 # 4. CHUẨN HÓA TỌA ĐỘ VÀ NỘI SUY
 # ==========================================
-def normalize_and_interpolate(seq):
+def normalize_and_interpolate(seq: np.ndarray) -> np.ndarray:
     T = len(seq)
     if T != N_FRAMES:
         x_old = np.linspace(0, 1, T)
@@ -160,68 +169,81 @@ def normalize_and_interpolate(seq):
     return normed.astype(np.float32)
 
 # ==========================================
-# 5. AUGMENTATION (TĂNG CƯỜNG DỮ LIỆU)
+# 5. AUGMENTATION (TĂNG CƯỜNG DỮ LIỆU TỐI ƯU HÓA)
 # ==========================================
-def augment(seq):
+def augment(seq: np.ndarray) -> np.ndarray:
     aug = seq.copy()
 
-    if np.random.rand() < 0.6:
-        aug += np.random.normal(0, 0.012, aug.shape).astype(np.float32)
+    # Thêm nhiễu Gaussian cực nhẹ để chống ghi nhớ tọa độ tĩnh
+    if np.random.rand() < 0.4:  # Giảm xác suất từ 0.6 xuống 0.4
+        aug += np.random.normal(0, 0.005, aug.shape).astype(np.float32)  # Giảm biên độ nhiễu
 
-    if np.random.rand() < 0.5:
-        aug *= np.random.uniform(0.88, 1.12)
-
-    if np.random.rand() < 0.5:
-        shift = np.random.randint(-3, 4)
-        if shift > 0:
-            aug = np.pad(aug, ((shift, 0), (0, 0)), mode="edge")[:N_FRAMES]
-        elif shift < 0:
-            aug = np.pad(aug, ((0, -shift), (0, 0)), mode="edge")[-shift:]
-
+    # Scale ngẫu nhiên nhẹ nhàng
     if np.random.rand() < 0.4:
-        warp  = np.random.uniform(0.85, 1.15)
-        T_new = max(5, int(N_FRAMES * warp))
-        x_old = np.linspace(0, 1, N_FRAMES)
-        x_new = np.linspace(0, 1, T_new)
-        warped = np.zeros((T_new, N_FEATURES), np.float32)
-        for i in range(N_FEATURES):
-            warped[:, i] = interp1d(x_old, aug[:, i], kind="linear",
-                                     fill_value="extrapolate")(x_new)
-        x_back = np.linspace(0, 1, T_new)
-        x_orig = np.linspace(0, 1, N_FRAMES)
-        for i in range(N_FEATURES):
-            aug[:, i] = interp1d(x_back, warped[:, i], kind="linear",
-                                  fill_value="extrapolate")(x_orig)
+        aug *= np.random.uniform(0.95, 1.05)  # Giảm biên độ co giãn xuống ±5% (thay vì ±12%)
 
+    # Lật ngang (horizontal flip) + hoán đổi tay trái/phải
     if np.random.rand() < 0.5:
+        # Lật x của body (pose + lh + rh)
         body = aug[:, :225].reshape(N_FRAMES, 75, 3).copy()
         body[:, :, 0] *= -1
+        # Hoán đổi LH (index 33-53) ↔ RH (index 54-74) trong pose+hands block
         lh_tmp = body[:, 33:54].copy()
         body[:, 33:54] = body[:, 54:75]
         body[:, 54:75] = lh_tmp
         aug[:, :225] = body.reshape(N_FRAMES, 225)
-        
+
+        # Lật x của lips
         lips = aug[:, 225:].reshape(N_FRAMES, 40, 3).copy()
         lips[:, :, 0] *= -1
         aug[:, 225:] = lips.reshape(N_FRAMES, 120)
 
+    # Loại bỏ hoàn toàn Time Shift (Dịch thời gian) và Time Warp (Co giãn thời gian)
+    # Vì hai phép này phá vỡ tính nhịp điệu của cử chỉ trên tập dữ liệu quá nhỏ.
+
     return aug.astype(np.float32)
-
 # ==========================================
-# 6. QUY TRÌNH NẠP DỮ LIỆU TÍCH HỢP BỘ NHỚ ĐỆM (CACHING)
+# 6. KIỂM TRA CACHE HỢP LỆ
 # ==========================================
-CACHE_X_PATH = os.path.join(MODEL_DIR, "X_cached.npy")
-CACHE_Y_PATH = os.path.join(MODEL_DIR, "y_cached.npy")
+CACHE_X_TRAIN    = os.path.join(MODEL_DIR, "X_train_cached.npy")
+CACHE_Y_TRAIN    = os.path.join(MODEL_DIR, "y_train_cached.npy")
+CACHE_X_VAL      = os.path.join(MODEL_DIR, "X_val_cached.npy")
+CACHE_Y_VAL      = os.path.join(MODEL_DIR, "y_val_cached.npy")
+CACHE_META_PATH  = os.path.join(MODEL_DIR, "cache_meta.json")
 
-# Kiểm tra sự tồn tại của bộ nhớ đệm trên ổ cứng
-if os.path.exists(CACHE_X_PATH) and os.path.exists(CACHE_Y_PATH):
-    print(f"\n📦 [BỘ NHỚ ĐỆM] Phát hiện dữ liệu tọa độ đã lưu từ trước!")
-    print(f"   Đang nạp nhanh tập dữ liệu từ ổ cứng...", flush=True)
-    X = np.load(CACHE_X_PATH)
-    Y = np.load(CACHE_Y_PATH)
-    print(f"✅ Nạp bộ nhớ đệm thành công — Tập dữ liệu: {X.shape}", flush=True)
+def _cache_is_valid() -> bool:
+    """
+    Cache hợp lệ khi:
+    1. Tất cả file .npy tồn tại
+    2. Số lớp trong cache khớp với NUM_CLASSES hiện tại
+    3. Danh sách nhãn trong cache khớp với unique_labels hiện tại
+    """
+    required = [CACHE_X_TRAIN, CACHE_Y_TRAIN, CACHE_X_VAL, CACHE_Y_VAL, CACHE_META_PATH]
+    if not all(os.path.exists(p) for p in required):
+        return False
+    try:
+        with open(CACHE_META_PATH, "r", encoding="utf-8") as f:
+            meta = json.load(f)
+        if meta.get("num_classes") != NUM_CLASSES:
+            print("⚠️  Cache lỗi thời: số lớp thay đổi — tạo lại cache...", flush=True)
+            return False
+        if meta.get("labels") != unique_labels:
+            print("⚠️  Cache lỗi thời: danh sách nhãn thay đổi — tạo lại cache...", flush=True)
+            return False
+    except Exception:
+        return False
+    return True
+# ==========================================
+# 7. NẠP HOẶC XÂY DỰNG DỮ LIỆU CHUẨN KHOA HỌC (SPLIT BEFORE AUGMENTATION)
+# ==========================================
+if _cache_is_valid():
+    print(f"\n📦 [CACHE] Phát hiện cache Train/Val hợp lệ — đang nạp...", flush=True)
+    X_train = np.load(CACHE_X_TRAIN)
+    y_train = np.load(CACHE_Y_TRAIN)
+    X_val   = np.load(CACHE_X_VAL)
+    y_val   = np.load(CACHE_Y_VAL)
+    print(f"✅ Nạp cache thành công — Train: {X_train.shape} | Val: {X_val.shape}", flush=True)
 else:
-    # Nếu chưa có bộ nhớ đệm, tiến hành trích xuất MediaPipe từ đầu
     all_videos = []
     for label in unique_labels:
         folder_path = os.path.join(VIDEOS_UPDATE, label)
@@ -229,49 +251,119 @@ else:
             if fname.lower().endswith(".mp4"):
                 all_videos.append((label, os.path.join(folder_path, fname), fname))
 
-    total = len(all_videos)
-    X_list, Y_list = [], []
-    print(f"\n🔄 Không tìm thấy bộ nhớ đệm. Bắt đầu trích xuất {total} video bằng MediaPipe...", flush=True)
-    ok = 0
+    if len(all_videos) == 0:
+        print("❌ Không tìm thấy video nào trong dataset!")
+        sys.exit(1)
 
-    for idx, (label, vpath, fname) in enumerate(all_videos):
+    # 2. Chia Train/Val trên video gốc (TRƯỚC khi augment) - gỡ bỏ stratify chống ValueError
+    train_videos, val_videos = train_test_split(
+        all_videos,
+        test_size=0.2,
+        random_state=SEED
+    )
+    
+    total_train = len(train_videos)
+    total_val   = len(val_videos)
+    print(f"\n📂 Tổng video: {len(all_videos)} | Train gốc: {total_train} | Val gốc: {total_val}", flush=True)
+
+    X_train_list, y_train_list = [], []
+    X_val_list,   y_val_list   = [], []
+
+    # 3. Trích xuất + Augment trên tập Train (Dùng enumerate chuẩn hóa Windows)
+    print(f"\n🔄 Trích xuất & Tăng cường tập Train...", flush=True)
+    skipped_train = 0
+    for idx, (label, vpath, fname) in enumerate(train_videos):
         label_id = label_to_id[label]
-        print(f"  [{idx+1}/{total}] {label}/{fname}", end=" ", flush=True)
-
+        
+        # In tiến độ tức thời
+        print(f"  [Train {idx+1}/{total_train}] {label}/{fname}", end=" ", flush=True)
+        
         raw = extract_features(vpath)
         if raw is None:
-            print("❌ (Video lỗi hoặc ngắn)", flush=True); continue
-
+            print("❌ (Lỗi)", flush=True)
+            skipped_train += 1
+            continue
+            
         base = normalize_and_interpolate(raw)
-        X_list.append(base)
-        Y_list.append(label_id)
+        X_train_list.append(base)
+        y_train_list.append(label_id)
         
+        # Nhân bản tập Train
         for _ in range(AUGMENT_COUNT):
-            X_list.append(augment(base))
-            Y_list.append(label_id)
-
-        ok += 1
+            X_train_list.append(augment(base))
+            y_train_list.append(label_id)
+            
         print("✅ (OK)", flush=True)
 
-    X = np.array(X_list, np.float32)
-    Y = np.array(Y_list, np.int32)
-    print(f"\n✅ Hoàn tất xử lý: {ok}/{total} video — Tập dữ liệu: {X.shape}", flush=True)
-    
-    # Tiến hành lưu lại bộ nhớ đệm ra file cứng để tái sử dụng nhanh lần sau
-    print("💾 Đang ghi bộ nhớ đệm ra ổ cứng để bảo toàn dữ liệu...", flush=True)
-    np.save(CACHE_X_PATH, X)
-    np.save(CACHE_Y_PATH, Y)
-    print("✅ Đã lưu bộ nhớ đệm thành công!", flush=True)
+    if skipped_train > 0:
+        print(f"⚠️  Bỏ qua {skipped_train} video lỗi trong tập Train", flush=True)
 
-# Phân chia dữ liệu train/val
-X_train, X_val, y_train, y_val = train_test_split(
-    X, Y, test_size=0.2, random_state=42, stratify=Y
-)
+    # 4. Trích xuất sạch tập Val (KHÔNG augment - Dùng enumerate chuẩn hóa Windows)
+    print(f"\n🔄 Trích xuất sạch tập Validation...", flush=True)
+    skipped_val = 0
+    for idx, (label, vpath, fname) in enumerate(val_videos):
+        label_id = label_to_id[label]
+        
+        # In tiến độ tức thời
+        print(f"  [Val {idx+1}/{total_val}] {label}/{fname}", end=" ", flush=True)
+        
+        raw = extract_features(vpath)
+        if raw is None:
+            print("❌ (Lỗi)", flush=True)
+            skipped_val += 1
+            continue
+            
+        base = normalize_and_interpolate(raw)
+        X_val_list.append(base)
+        y_val_list.append(label_id)
+        
+        print("✅ (OK)", flush=True)
+
+    if skipped_val > 0:
+        print(f"⚠️  Bỏ qua {skipped_val} video lỗi trong tập Val", flush=True)
+
+    if len(X_train_list) == 0 or len(X_val_list) == 0:
+        print("❌ Không đủ dữ liệu để huấn luyện!")
+        sys.exit(1)
+
+    X_train = np.array(X_train_list, np.float32)
+    y_train = np.array(y_train_list, np.int32)
+    X_val   = np.array(X_val_list,   np.float32)
+    y_val   = np.array(y_val_list,   np.int32)
+
+    # 5. Lưu cache kèm metadata
+    np.save(CACHE_X_TRAIN, X_train)
+    np.save(CACHE_Y_TRAIN, y_train)
+    np.save(CACHE_X_VAL,   X_val)
+    np.save(CACHE_Y_VAL,   y_val)
+    cache_meta = {"num_classes": NUM_CLASSES, "labels": unique_labels}
+    with open(CACHE_META_PATH, "w", encoding="utf-8") as f:
+        json.dump(cache_meta, f, ensure_ascii=False, indent=2)
+
+    print(f"\n✅ Đã tạo cache thành công — Train: {X_train.shape} | Val: {X_val.shape}", flush=True)
 
 # ==========================================
-# 7. XÂY DỰNG MÔ HÌNH BiLSTM
+# 8. CLASS WEIGHT (XỬ LÝ MẤT CÂN BẰNG DỮ LIỆU TÙY CHỈNH)
 # ==========================================
-print("\n🧠 ĐANG KHỞI TẠO CẤU TRÚC MÔ HÌNH BiLSTM (345 ĐẶC TRƯNG)...", flush=True)
+class_weight_dict = {}
+total_samples = len(y_train)
+unique_classes, class_counts = np.unique(y_train, return_counts=True)
+count_dict = dict(zip(unique_classes, class_counts))
+
+for i in range(NUM_CLASSES):
+    if i in count_dict:
+        # Công thức chuẩn "balanced" của scikit-learn
+        class_weight_dict[i] = total_samples / (NUM_CLASSES * count_dict[i])
+    else:
+        # Nếu nhãn vô tình bị vắng mặt trong tập Train, gán trọng số an toàn = 1.0
+        class_weight_dict[i] = 1.0
+
+print(f"\n⚖️ Đã tính toán xong Class Weights an toàn cho toàn bộ {len(class_weight_dict)} lớp.", flush=True)
+
+# ==========================================
+# 9. XÂY DỰNG MÔ HÌNH BiLSTM
+# ==========================================
+print("\n🧠 KHỞI TẠO MÔ HÌNH BiLSTM...", flush=True)
 
 inputs = tf.keras.Input(shape=(N_FRAMES, N_FEATURES), name="keypoints")
 x = tf.keras.layers.Bidirectional(tf.keras.layers.LSTM(128, return_sequences=True))(inputs)
@@ -292,42 +384,65 @@ model.compile(
     metrics=["accuracy"],
 )
 
+# ==========================================
+# 10. CALLBACKS
+# ==========================================
+BEST_MODEL_PATH = os.path.join(MODEL_DIR, "best_bilstm.keras")
+
 callbacks = [
     tf.keras.callbacks.ModelCheckpoint(
-        filepath=os.path.join(MODEL_DIR, "best_bilstm.keras"),
-        monitor="val_accuracy", save_best_only=True, verbose=1,
+        filepath=BEST_MODEL_PATH,
+        monitor="val_accuracy",
+        save_best_only=True,
+        verbose=1,
     ),
     tf.keras.callbacks.EarlyStopping(
-        monitor="val_accuracy", patience=20,
-        restore_best_weights=True, verbose=1,
+        monitor="val_accuracy",
+        patience=15,                  # Giảm từ 20 → 15 để tránh tốn thời gian
+        restore_best_weights=True,
+        verbose=1,
     ),
     tf.keras.callbacks.ReduceLROnPlateau(
-        monitor="val_loss", factor=0.5, patience=7,
-        min_lr=1e-6, verbose=1,
+        monitor="val_loss",
+        factor=0.5,
+        patience=7,
+        min_lr=1e-6,
+        verbose=1,
     ),
     tf.keras.callbacks.CSVLogger(os.path.join(MODEL_DIR, "training_log.csv")),
 ]
 
 # ==========================================
-# 8. HUẤN LUYỆN
+# 11. HUẤN LUYỆN
 # ==========================================
-print("\n⚡ BẮT ĐẦU QUÁ TRÌNH HUẤN LUYỆN MÔ HÌNH TRÊN GPU...", flush=True)
-model.fit(
+print("\n⚡ BẮT ĐẦU HUẤN LUYỆN...", flush=True)
+history = model.fit(
     X_train, y_train,
     validation_data=(X_val, y_val),
-    epochs=150, batch_size=32,
-    callbacks=callbacks, verbose=1,
+    epochs=150,
+    batch_size=32,
+    class_weight=class_weight_dict,   # ← FIX: xử lý mất cân bằng
+    callbacks=callbacks,
+    verbose=1,
 )
 
 # ==========================================
-# 9. ĐÁNH GIÁ & XUẤT MÔ HÌNH
+# 12. ĐÁNH GIÁ & XUẤT MÔ HÌNH
 # ==========================================
-best = tf.keras.models.load_model(os.path.join(MODEL_DIR, "best_bilstm.keras"))
+best = tf.keras.models.load_model(BEST_MODEL_PATH)
 val_loss, val_acc = best.evaluate(X_val, y_val, verbose=0)
 print(f"\n📊 Kết quả tốt nhất — val_loss: {val_loss:.4f} | val_acc: {val_acc:.4f}", flush=True)
 
-best.export(os.path.join(MODEL_DIR, "vsl_bilstm_savedmodel"))
-print(f"\n🎉 HOÀN TẤT QUÁ TRÌNH HUẤN LUYỆN!", flush=True)
-print(f"   Mô hình lưu tại : {os.path.join(MODEL_DIR, 'best_bilstm.keras')}", flush=True)
-print(f"   Bản đồ nhãn     : {os.path.join(MODEL_DIR, 'label_map.json')}", flush=True)
-print(f"   Nhật ký huấn luyện: {os.path.join(MODEL_DIR, 'training_log.csv')}", flush=True)
+# Lưu dạng .keras (fine-tune được)
+final_keras_path = os.path.join(MODEL_DIR, "vsl_bilstm_final.keras")
+best.save(final_keras_path)
+
+# Xuất dạng SavedModel (inference/TFLite)
+saved_model_path = os.path.join(MODEL_DIR, "vsl_bilstm_savedmodel")
+best.export(saved_model_path)
+
+print(f"\n🎉 HOÀN TẤT!", flush=True)
+print(f"   Model (.keras)    : {final_keras_path}", flush=True)
+print(f"   Model (SavedModel): {saved_model_path}", flush=True)
+print(f"   Label map         : {label_map_path}", flush=True)
+print(f"   Training log      : {os.path.join(MODEL_DIR, 'training_log.csv')}", flush=True)

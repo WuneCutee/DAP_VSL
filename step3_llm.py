@@ -246,7 +246,7 @@ def run_translation_evaluation():
         ref_text   = item["text"]
         
         # Bắt buộc đặt skip_exact_match=True khi đánh giá để kiểm thử thực lực dịch thuật của mô hình
-        pred_text, latency = translate_gloss_to_text(gloss_list, use_gpu=False, skip_exact_match=True)
+        pred_text, latency = translate_gloss_to_text(gloss_list, use_gpu=True, skip_exact_match=True)
         
         hypotheses.append(pred_text)
         references.append(ref_text)
